@@ -15,52 +15,77 @@ URL = "https://bigbox.ee/search?text=sensai"
 
 
 async def fetch_products():
-    """Парсит bigbox.ee и возвращает список товаров Sensai с ценами."""
     products = {}
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        await page.goto(URL, wait_until="networkidle", timeout=60000)
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+        )
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        page = await context.new_page()
 
-        # Ждём появления товаров
+        # Используем domcontentloaded вместо networkidle — быстрее и надёжнее
         try:
-            await page.wait_for_selector(".product-miniature, .product-list-item, [class*='product']", timeout=15000)
-        except Exception:
-            pass
+            await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
+        except Exception as e:
+            print(f"Ошибка загрузки страницы: {e}")
+            await browser.close()
+            return products
 
-        # Прокрутить страницу чтобы загрузить все товары
-        for _ in range(5):
-            await page.evaluate("window.scrollBy(0, 800)")
-            await asyncio.sleep(0.5)
+        # Даём JS время отрендерить товары
+        await asyncio.sleep(5)
 
-        # Попробуем найти товары через разные селекторы
-        items = await page.query_selector_all("article, .product-miniature, [class*='product-item'], [class*='productItem']")
+        # Прокрутка для lazy-load
+        for _ in range(6):
+            await page.evaluate("window.scrollBy(0, 600)")
+            await asyncio.sleep(0.7)
+
+        await asyncio.sleep(2)
+
+        # Пробуем разные селекторы товаров
+        selectors = [
+            "article",
+            ".product-miniature",
+            "[class*='product-item']",
+            "[class*='ProductItem']",
+            "[class*='product_item']",
+            ".js-product",
+        ]
+
+        items = []
+        for sel in selectors:
+            items = await page.query_selector_all(sel)
+            if items:
+                print(f"Нашёл {len(items)} элементов по селектору: {sel}")
+                break
 
         for item in items:
             try:
-                # Название
-                name_el = await item.query_selector("h2, h3, .product-title, [class*='name'], [class*='title']")
+                name_el = await item.query_selector(
+                    "h2, h3, h4, .product-title, [class*='name'], [class*='title'], a[title]"
+                )
                 if not name_el:
                     continue
                 name = (await name_el.inner_text()).strip()
-
-                # Фильтруем только Sensai
-                if "sensai" not in name.lower():
+                if not name or "sensai" not in name.lower():
                     continue
 
-                # Цена
-                price_el = await item.query_selector("[class*='price'], .price, span[itemprop='price']")
+                price_el = await item.query_selector(
+                    "[class*='price']:not([class*='old']):not([class*='regular']), "
+                    "span[itemprop='price'], [class*='current-price'], [class*='currentPrice']"
+                )
                 if not price_el:
                     continue
                 price_text = (await price_el.inner_text()).strip()
-
-                # Извлекаем число из цены
                 price_clean = re.sub(r"[^\d,.]", "", price_text).replace(",", ".")
-                if not price_clean:
+                # Берём первое число если их несколько
+                match = re.search(r"\d+\.?\d*", price_clean)
+                if not match:
                     continue
-                price = float(price_clean)
+                price = float(match.group())
 
-                # Ссылка
                 link_el = await item.query_selector("a")
                 link = ""
                 if link_el:
@@ -69,18 +94,27 @@ async def fetch_products():
                         link = "https://bigbox.ee" + link
 
                 products[name] = {"price": price, "link": link}
+                print(f"  Товар: {name} — {price}€")
 
-            except Exception:
+            except Exception as e:
                 continue
 
-        # Если не нашли через article, попробуем через JSON в странице
+        # Fallback: ищем данные в JSON на странице
         if not products:
+            print("Пробую JSON-парсинг страницы...")
             content = await page.content()
-            # Ищем структурированные данные
-            json_matches = re.findall(r'"name"\s*:\s*"([^"]*sensai[^"]*)".*?"price"\s*:\s*"?([\d.]+)"?', content, re.IGNORECASE)
-            for match in json_matches:
-                name, price = match
-                products[name] = {"price": float(price), "link": URL}
+            # Ищем JSON с товарами
+            patterns = [
+                r'"name"\s*:\s*"([^"]*[Ss]ensai[^"]*)"[^}]*?"price"\s*:\s*["\']?([\d.]+)',
+                r'"title"\s*:\s*"([^"]*[Ss]ensai[^"]*)"[^}]*?"price"\s*:\s*["\']?([\d.]+)',
+            ]
+            for pattern in patterns:
+                matches = re.findall(pattern, content, re.IGNORECASE | re.DOTALL)
+                for name, price in matches:
+                    name = name.strip()
+                    if name not in products:
+                        products[name] = {"price": float(price), "link": URL}
+                        print(f"  JSON товар: {name} — {price}€")
 
         await browser.close()
     return products
@@ -118,7 +152,7 @@ def find_discounts(current, previous):
 
 async def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(url, json={
             "chat_id": TELEGRAM_CHAT_ID,
             "text": text,
@@ -132,16 +166,15 @@ async def main():
     print(f"[{datetime.now()}] Запуск трекера Sensai...")
 
     current = await fetch_products()
-    print(f"Найдено товаров: {len(current)}")
+    print(f"Итого найдено товаров: {len(current)}")
 
     if not current:
-        print("Товары не найдены. Проверь парсер.")
+        print("Товары не найдены.")
         await send_telegram("⚠️ <b>Sensai Tracker</b>: не удалось загрузить товары с bigbox.ee. Проверю завтра.")
         return
 
     previous = load_previous_prices()
     discounts = find_discounts(current, previous)
-
     save_prices(current)
 
     if not previous:
